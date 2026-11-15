@@ -16,8 +16,9 @@ import config
 import db
 import main as job
 
-# 所有可选分类（与 main.py 中的提示词保持一致）
-CATEGORIES = ["紧急待办", "重要阅读", "通知", "垃圾"]
+# 可选值统一定义在 main.py，避免界面和提示词不一致
+CATEGORIES = list(job.CATEGORIES)
+EMAIL_TYPES = list(job.EMAIL_TYPES)
 
 st.set_page_config(page_title="邮件自动分类助手", page_icon="📬", layout="wide")
 db.init_db()
@@ -116,18 +117,21 @@ with st.sidebar:
 # ---------------------- 顶部：分类统计 ----------------------
 
 
-def render_stats():
-    """用四个指标卡展示数据库中各分类的邮件数量。"""
+def render_stats(rows):
+    """指标卡：总数 + 四档紧急程度 + 已超时。"""
     counts = db.count_by_category()
-    cols = st.columns(5)
-    total = sum(counts.values())
-    cols[0].metric("总计", total)
-    for col, name in zip(cols[1:], CATEGORIES):
+    overdue_count = sum(1 for r in rows if db.is_overdue(r.get("deadline")))
+    cols = st.columns(6)
+    cols[0].metric("总计", sum(counts.values()))
+    for col, name in zip(cols[1:5], CATEGORIES):
         col.metric(name, counts.get(name, 0))
+    cols[5].metric("⏰ 已超时", overdue_count)
 
+
+all_rows = [dict(r) for r in db.list_emails()]
 
 st.title("📬 邮件自动分类助手")
-render_stats()
+render_stats(all_rows)
 
 # ---------------------- 点击「拉取并分类」后的处理 ----------------------
 
@@ -169,59 +173,65 @@ if run_clicked:
                 status.success(
                     f"完成：读取 {len(emails)} 封，新增 {new_count} 封，重复跳过 {skip_count} 封"
                 )
-                # 重新生成当天的 Markdown 汇总
-                rows = db.list_emails(categories=job.KEY_CATEGORIES, today_only=True)
+                # 重新生成 Markdown 汇总（含历史遗留的已超时邮件）
+                rows = db.list_emails(categories=job.KEY_CATEGORIES)
                 job.write_summary_md(rows)
         except Exception as exc:
             st.error(f"执行失败：{exc}")
 
-# ---------------------- 主体：两个标签页 ----------------------
 
-tab_list, tab_summary = st.tabs(["📥 邮件管理", "📄 每日汇总"])
+# ---------------------- 邮件表格 + 预览面板 ----------------------
 
-# ============ 标签页 1：邮件管理（查看 / 修改 / 删除） ============
 
-with tab_list:
-    f_col1, f_col2 = st.columns([2, 3])
-    with f_col1:
-        selected_categories = st.multiselect("按分类筛选", CATEGORIES, default=CATEGORIES)
-    with f_col2:
-        keyword = st.text_input("搜索（主题 / 发件人 / 摘要 / 正文）", placeholder="输入关键字后自动过滤")
-
-    rows = db.list_emails(categories=selected_categories or None, keyword=keyword or None)
-
+def render_panel(rows, key_prefix):
+    """左侧可编辑表格，右侧快速预览，两者共用同一批邮件。"""
     if not rows:
-        st.info("数据库里还没有符合条件的邮件，先点左侧「拉取未读邮件并分类」。")
-    else:
-        # 转成 DataFrame 供表格编辑；列名用中文便于阅读
-        df = pd.DataFrame([dict(r) for r in rows])
-        df = df.rename(
-            columns={
-                "id": "ID",
-                "category": "分类",
-                "summary": "摘要",
-                "todo": "待办事项",
-                "subject": "主题",
-                "sender": "发件人",
-                "created_at": "入库时间",
-            }
-        )
-        df = df[["ID", "分类", "摘要", "待办事项", "主题", "发件人", "入库时间"]]
-        df.insert(0, "选择", False)  # 勾选列，用于批量删除
-        original = df.copy()  # 保存原始值，用于判断哪些行被改过
+        st.info("没有符合条件的邮件。")
+        return
 
-        st.caption("「分类」「摘要」「待办事项」可直接双击修改，勾选最左侧方框可删除。")
+    df = pd.DataFrame([dict(r) for r in rows])
+    df["状态"] = df["deadline"].apply(lambda d: "已超时" if db.is_overdue(d) else "")
+    df = df.rename(
+        columns={
+            "id": "ID",
+            "college": "学院",
+            "email_type": "类型",
+            "category": "紧急程度",
+            "deadline": "截止时间",
+            "summary": "摘要",
+            "todo": "待办事项",
+            "subject": "主题",
+            "sender": "发件人",
+            "created_at": "入库时间",
+        }
+    )
+    df = df[
+        ["ID", "状态", "学院", "类型", "紧急程度", "截止时间",
+         "摘要", "待办事项", "主题", "发件人", "入库时间"]
+    ]
+    df.insert(0, "选择", False)  # 勾选列，用于批量删除
+    original = df.copy()  # 保存原始值，用于判断哪些行被改过
 
+    left, right = st.columns([2.2, 1], gap="medium")
+
+    with left:
+        st.caption("「学院」「类型」「紧急程度」「截止时间」「摘要」「待办事项」可直接双击修改，勾选最左侧方框可删除。")
         edited = st.data_editor(
             df,
-            key=f"email_editor_{'|'.join(selected_categories)}_{keyword}",
+            key=f"editor_{key_prefix}",
             hide_index=True,
             width="stretch",
-            disabled=["ID", "主题", "发件人", "入库时间"],
+            disabled=["ID", "状态", "主题", "发件人", "入库时间"],
             column_config={
                 "选择": st.column_config.CheckboxColumn("删除", width="small"),
                 "ID": st.column_config.NumberColumn("ID", width="small"),
-                "分类": st.column_config.SelectboxColumn("分类", options=CATEGORIES, required=True),
+                "状态": st.column_config.TextColumn("状态", width="small"),
+                "学院": st.column_config.TextColumn("学院", width="medium"),
+                "类型": st.column_config.SelectboxColumn("类型", options=EMAIL_TYPES, required=True),
+                "紧急程度": st.column_config.SelectboxColumn("紧急程度", options=CATEGORIES, required=True),
+                "截止时间": st.column_config.TextColumn(
+                    "截止时间", width="small", help="格式 YYYY-MM-DD HH:MM，留空表示没有截止时间"
+                ),
                 "摘要": st.column_config.TextColumn("摘要", width="large"),
                 "待办事项": st.column_config.TextColumn("待办事项", width="large"),
                 "主题": st.column_config.TextColumn("主题", width="large"),
@@ -229,13 +239,24 @@ with tab_list:
         )
 
         btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 3])
-        save_clicked = btn_col1.button("💾 保存修改", type="primary", width="stretch")
-        delete_clicked = btn_col2.button("🗑️ 删除选中", width="stretch")
+        save_clicked = btn_col1.button(
+            "💾 保存修改", type="primary", width="stretch", key=f"save_{key_prefix}"
+        )
+        delete_clicked = btn_col2.button(
+            "🗑️ 删除选中", width="stretch", key=f"delete_{key_prefix}"
+        )
 
         # ---- 保存修改：逐行对比，只更新有变化的字段 ----
         if save_clicked:
             # 表头中文名 -> 数据库字段名
-            column_map = {"分类": "category", "摘要": "summary", "待办事项": "todo"}
+            column_map = {
+                "学院": "college",
+                "类型": "email_type",
+                "紧急程度": "category",
+                "截止时间": "deadline",
+                "摘要": "summary",
+                "待办事项": "todo",
+            }
             changed = 0
             for i in range(len(edited)):
                 row_id = int(edited.at[i, "ID"])
@@ -245,7 +266,12 @@ with tab_list:
                     after = edited.at[i, column]
                     before = "" if pd.isna(before) else str(before)
                     after = "" if pd.isna(after) else str(after)
-                    if after != before:
+                    if after == before:
+                        continue
+                    if field == "deadline":
+                        # 统一成 YYYY-MM-DD HH:MM，非法输入写回空值
+                        updates[field] = job.normalize_deadline(after) or None
+                    else:
                         # 空字符串写回数据库时存为 NULL
                         updates[field] = after.strip() or None
                 if updates:
@@ -266,29 +292,116 @@ with tab_list:
                 st.success(f"已删除 {deleted} 封邮件")
                 st.rerun()
 
-        # ---- 邮件详情：选择一封查看完整正文 ----
-        with st.expander("🔍 查看邮件详情"):
-            options = {f"{r['id']} | {r['subject']}": r["id"] for r in rows}
-            picked = st.selectbox("选择邮件", list(options.keys()))
-            if picked:
-                detail = db.get_email(options[picked])
-                st.write(f"**发件人**：{detail['sender']}")
-                st.write(f"**主题**：{detail['subject']}")
-                st.write(f"**分类**：{detail['category']}")
-                st.write(f"**摘要**：{detail['summary']}")
-                st.write(f"**待办事项**：{detail['todo'] or '无'}")
-                st.text_area("正文", detail["body"] or "", height=240, disabled=True)
+    # ---- 右侧：快速预览 ----
+    with right:
+        st.subheader("📄 快速预览")
+        options = {f"{r['id']} | {r['subject'][:36]}": r["id"] for r in rows}
+        picked = st.selectbox("选择邮件", list(options.keys()), key=f"preview_{key_prefix}")
+        detail = dict(db.get_email(options[picked]))
 
-# ============ 标签页 2：每日汇总 ============
+        st.markdown(f"**{detail['subject']}**")
+        st.caption(f"{detail['sender']} · 入库 {detail['created_at']}")
+        meta = (
+            f"🏫 {detail.get('college') or '其他'}　"
+            f"📌 {detail.get('email_type') or '其他'}　"
+            f"⚡ {detail['category']}"
+        )
+        if detail.get("deadline"):
+            meta += f"　⏰ {detail['deadline']}"
+        st.markdown(meta)
+
+        if db.is_overdue(detail.get("deadline")):
+            st.error("已超时：该邮件的截止时间已过")
+        else:
+            st.success("未超时")
+
+        st.markdown(f"**摘要**：{detail['summary'] or '无'}")
+        st.markdown(f"**待办**：{detail['todo'] or '无'}")
+        st.caption("正文预览（前 600 字）")
+        st.text_area(
+            "正文",
+            (detail["body"] or "")[:600],
+            height=280,
+            disabled=True,
+            label_visibility="collapsed",
+            key=f"body_{key_prefix}",
+        )
+
+
+# ---------------------- 主体：三个标签页 ----------------------
+
+tab_list, tab_overdue, tab_summary = st.tabs(["📥 邮件管理", "⏰ 已超时", "📄 每日汇总"])
+
+# ============ 标签页 1：邮件管理（按学院 / 类型筛选 + 查看 / 修改 / 删除） ============
+
+with tab_list:
+    f_col1, f_col2, f_col3 = st.columns(3)
+    with f_col1:
+        selected_categories = st.multiselect("紧急程度", CATEGORIES, default=CATEGORIES)
+    with f_col2:
+        college_options = sorted({r.get("college") or "其他" for r in all_rows})
+        selected_colleges = st.multiselect("学院", college_options, default=[])
+    with f_col3:
+        selected_types = st.multiselect("类型", EMAIL_TYPES, default=[])
+
+    keyword = st.text_input(
+        "搜索（主题 / 发件人 / 摘要 / 正文）", placeholder="输入关键字后自动过滤"
+    )
+
+    def match(r):
+        if selected_categories and r["category"] not in selected_categories:
+            return False
+        if selected_colleges and (r.get("college") or "其他") not in selected_colleges:
+            return False
+        if selected_types and r.get("email_type") not in selected_types:
+            return False
+        if keyword:
+            haystack = " ".join(
+                str(r.get(k) or "") for k in ("subject", "sender", "summary", "body")
+            )
+            if keyword not in haystack:
+                return False
+        return True
+
+    filtered = [r for r in all_rows if match(r)]
+    editor_key = "all_%s_%s_%s_%s" % (
+        "|".join(selected_categories),
+        "|".join(selected_colleges),
+        "|".join(selected_types),
+        keyword,
+    )
+    render_panel(filtered, editor_key)
+
+# ============ 标签页 2：已超时（截止时间已过） ============
+
+with tab_overdue:
+    overdue_rows = [r for r in all_rows if db.is_overdue(r.get("deadline"))]
+    st.caption(f"截止时间早于当前的邮件，共 {len(overdue_rows)} 封。可在右侧预览原文，或在左侧改截止时间/分类。")
+
+    overdue_keyword = ""
+    if overdue_rows:
+        overdue_keyword = st.text_input(
+            "在已超时邮件中搜索", placeholder="主题 / 发件人 / 摘要", key="overdue_keyword"
+        )
+        if overdue_keyword:
+            overdue_rows = [
+                r for r in overdue_rows
+                if overdue_keyword
+                in " ".join(str(r.get(k) or "") for k in ("subject", "sender", "summary"))
+            ]
+
+    render_panel(overdue_rows, f"overdue_{overdue_keyword}")
+
+# ============ 标签页 3：每日汇总 ============
 
 with tab_summary:
     col_a, col_b = st.columns([1, 3])
     if col_a.button("📝 重新生成 每日汇总.md", width="stretch"):
-        rows = db.list_emails(categories=job.KEY_CATEGORIES, today_only=True)
+        rows = db.list_emails(categories=job.KEY_CATEGORIES)
         job.write_summary_md(rows)
         st.success("已重新生成")
 
-    summary_rows = db.list_emails(categories=job.KEY_CATEGORIES, today_only=True)
+    summary_rows = db.list_emails(categories=job.KEY_CATEGORIES)
     markdown = job.build_markdown(summary_rows)
     st.download_button(
         "⬇️ 下载 Markdown",
@@ -297,7 +410,10 @@ with tab_summary:
         mime="text/markdown",
         width="content",
     )
-    st.caption(f"汇总范围：今天入库的「紧急待办」和「重要阅读」，共 {len(summary_rows)} 封")
+    st.caption(
+        "汇总范围：全部「紧急待办」「重要阅读」，已超时的单独归入「已超时」栏目，"
+        f"共 {len(summary_rows)} 封"
+    )
     st.markdown(markdown)
 
     if os.path.exists(job.OUTPUT_FILE):

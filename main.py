@@ -50,6 +50,21 @@ MAX_BODY_CHARS = 3000
 # 需要汇总进 Markdown 的分类
 KEY_CATEGORIES = ("紧急待办", "重要阅读")
 
+# 紧急程度（保留原有四档）
+CATEGORIES = ("紧急待办", "重要阅读", "通知", "垃圾")
+
+# 邮件类型（按内容性质划分，与提示词保持一致）
+EMAIL_TYPES = (
+    "讲座通知",
+    "学术会议",
+    "比赛通知",
+    "老师回信",
+    "行政通知",
+    "招生招聘",
+    "期刊推送",
+    "其他",
+)
+
 # ============================== 工具函数 ==============================
 
 
@@ -198,19 +213,47 @@ def fetch_unread_emails(account=None, password=None, server=None, port=None):
 SYSTEM_PROMPT = """你是一个邮件分类助手。请阅读邮件内容，只输出一个 JSON 对象，不要输出任何其他文字、解释或代码块标记。
 
 JSON 字段要求：
-- "category": 只能是以下四个值之一："紧急待办"、"重要阅读"、"通知"、"垃圾"
+- "college": 邮件来自哪个学院或单位，填最简短的官方名称，例如 "航空学院"、"沈元学院"、"科学技术研究院"；无法判断填 "其他"
+- "email_type": 邮件类型，只能是以下值之一：讲座通知、学术会议、比赛通知、老师回信、行政通知、招生招聘、期刊推送、其他
+- "category": 紧急程度，只能是以下四个值之一：紧急待办、重要阅读、通知、垃圾
 - "summary": 邮件摘要，50 个汉字以内
 - "todo": 需要我执行的待办事项，用一句话描述；如果邮件没有明确待办则填 null
+- "deadline": 邮件中明确写出的截止时间（报名截止、提交截止、活动开始等），格式 "YYYY-MM-DD HH:MM"；只有日期就填 "YYYY-MM-DD"；年份必须与邮件本身的时间一致（邮件里常只写月日，请按邮件时间补全年份）；没有明确时间填 null
 
-分类标准：
+类型判断标准：
+- 讲座通知：学术讲座、论坛、报告会、大讲堂
+- 学术会议：会议征稿、研讨会、专委会会议
+- 比赛通知：学科竞赛、创新创业大赛、作品征集
+- 老师回信：老师、导师或同事针对具体事项的一对一回复
+- 行政通知：放假、报销、系统维护、账号认证等事务性通知
+- 招生招聘：招生简章、招聘、人才计划
+- 期刊推送：期刊目录、电子刊、学报推送
+- 其他：无法归入以上类型
+
+紧急程度判断标准：
 - 紧急待办：有明确截止时间或需要我立刻处理/回复的事情
 - 重要阅读：值得认真阅读的重要信息（项目、学业、会议、通知性但重要）
 - 通知：一般性通知、公告、系统消息
 - 垃圾：广告、推广、营销、可忽略的内容"""
 
 
+def normalize_deadline(value):
+    """把模型返回的截止时间统一成 YYYY-MM-DD HH:MM，识别不了就返回空字符串。"""
+    if not value:
+        return ""
+    text = str(value).strip().replace("/", "-").replace("T", " ")
+    match = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?", text)
+    if not match:
+        return ""
+    year, month, day, hour, minute = match.groups()
+    if hour is None:
+        # 只有日期时，按当天 23:59 截止
+        return f"{int(year):04d}-{int(month):02d}-{int(day):02d} 23:59"
+    return f"{int(year):04d}-{int(month):02d}-{int(day):02d} {int(hour):02d}:{int(minute):02d}"
+
+
 def classify_email(client, email_item):
-    """调用大模型对单封邮件分类，返回 dict：category / summary / todo。"""
+    """调用大模型对单封邮件分类，返回 dict：college / email_type / category / summary / todo / deadline。"""
     user_content = (
         f"发件人：{email_item['sender']}\n"
         f"主题：{email_item['subject']}\n"
@@ -231,7 +274,14 @@ def classify_email(client, email_item):
     except Exception as exc:
         # 单封失败不影响整体流程，但要如实写出失败原因（如 APIConnectionError、401 等）
         print(f"  [接口调用失败] {type(exc).__name__}: {exc}")
-        return {"category": "通知", "summary": f"接口调用失败：{type(exc).__name__}", "todo": None}
+        return {
+            "college": "其他",
+            "email_type": "其他",
+            "category": "通知",
+            "summary": f"接口调用失败：{type(exc).__name__}",
+            "todo": None,
+            "deadline": "",
+        }
 
     # 2) 从返回内容里取 JSON（模型偶尔会包一层 ```json 或前后带说明文字）
     data = None
@@ -245,58 +295,89 @@ def classify_email(client, email_item):
 
     if not isinstance(data, dict):
         print(f"  [格式异常] 模型返回：{content[:200]}")
-        return {"category": "通知", "summary": "模型返回格式异常", "todo": None}
+        return {
+            "college": "其他",
+            "email_type": "其他",
+            "category": "通知",
+            "summary": "模型返回格式异常",
+            "todo": None,
+            "deadline": "",
+        }
 
-    # 字段校验，避免模型返回缺字段或非法分类
+    # 3) 字段校验，避免模型返回缺字段或非法取值
     category = data.get("category")
-    if category not in ("紧急待办", "重要阅读", "通知", "垃圾"):
+    if category not in CATEGORIES:
         category = "通知"
 
+    email_type = (data.get("email_type") or "").strip()
+    if email_type not in EMAIL_TYPES:
+        email_type = "其他"
+
+    college = (data.get("college") or "").strip().strip("【】") or "其他"
+
     return {
+        "college": college,
+        "email_type": email_type,
         "category": category,
         "summary": (data.get("summary") or "").strip(),
         "todo": data.get("todo") or None,
+        "deadline": normalize_deadline(data.get("deadline")),
     }
 
 
 # ============================== 生成 Markdown ==============================
 
 
+def _markdown_item(index, item):
+    """渲染单封邮件的 Markdown 片段。"""
+    lines = [f"### {index}. {item['subject']}"]
+    lines.append(f"- **发件人**：{item['sender']}")
+    if item.get("college"):
+        lines.append(f"- **学院/单位**：{item['college']}")
+    if item.get("email_type"):
+        lines.append(f"- **类型**：{item['email_type']}")
+    lines.append(f"- **摘要**：{item['summary']}")
+    lines.append(f"- **待办**：{item['todo'] or '无'}")
+    if item.get("deadline"):
+        lines.append(f"- **截止时间**：{item['deadline']}")
+    lines.append("")
+    return lines
+
+
 def build_markdown(results):
-    """把「紧急待办」和「重要阅读」的邮件汇总成 Markdown 字符串。"""
+    """把邮件按「已超时 / 紧急待办 / 重要阅读」汇总成 Markdown 字符串。
+
+    超过截止时间的邮件单独放进「已超时」栏目，不再计入紧急待办。
+    """
     today = datetime.now().strftime("%Y-%m-%d")
     lines = [f"# 每日邮件汇总（{today}）", ""]
 
-    urgent = [r for r in results if r["category"] == "紧急待办"]
-    reading = [r for r in results if r["category"] == "重要阅读"]
+    rows = [dict(r) for r in results]
+    # 已超时：有截止时间且早于当前时间
+    overdue = [r for r in rows if db.is_overdue(r.get("deadline"))]
+    # 紧急待办 / 重要阅读：排除已超时的
+    urgent = [
+        r for r in rows
+        if r["category"] == "紧急待办" and not db.is_overdue(r.get("deadline"))
+    ]
+    reading = [
+        r for r in rows
+        if r["category"] == "重要阅读" and not db.is_overdue(r.get("deadline"))
+    ]
 
-    if not urgent and not reading:
-        lines.append("> 今日没有紧急待办或重要阅读的邮件。")
+    if not (overdue or urgent or reading):
+        lines.append("> 今日没有已超时、紧急待办或重要阅读的邮件。")
         return "\n".join(lines)
 
-    # 紧急待办
-    if urgent:
-        lines.append("## 紧急待办")
+    for title, items in (("已超时", overdue), ("紧急待办", urgent), ("重要阅读", reading)):
+        if not items:
+            continue
+        lines.append(f"## {title}")
         lines.append("")
-        for i, item in enumerate(urgent, 1):
-            lines.append(f"### {i}. {item['subject']}")
-            lines.append(f"- **发件人**：{item['sender']}")
-            lines.append(f"- **摘要**：{item['summary']}")
-            lines.append(f"- **待办**：{item['todo'] or '无'}")
-            lines.append("")
+        for i, item in enumerate(items, 1):
+            lines.extend(_markdown_item(i, item))
 
-    # 重要阅读
-    if reading:
-        lines.append("## 重要阅读")
-        lines.append("")
-        for i, item in enumerate(reading, 1):
-            lines.append(f"### {i}. {item['subject']}")
-            lines.append(f"- **发件人**：{item['sender']}")
-            lines.append(f"- **摘要**：{item['summary']}")
-            lines.append(f"- **待办**：{item['todo'] or '无'}")
-            lines.append("")
-
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip()
 
 
 def write_summary_md(rows, path=None):
@@ -334,6 +415,9 @@ def process_emails(emails, client, on_progress=None):
             "category": result["category"],
             "summary": result["summary"],
             "todo": result["todo"],
+            "college": result["college"],
+            "email_type": result["email_type"],
+            "deadline": result["deadline"],
             "mail_date": email_item.get("mail_date", ""),
         }
         is_new, _ = db.save_email(record)
@@ -342,7 +426,7 @@ def process_emails(emails, client, on_progress=None):
         else:
             skip_count += 1
             print("  -> 数据库中已存在，跳过")
-        print(f"  -> {result['category']}：{result['summary']}")
+        print(f"  -> [{result['college']}/{result['email_type']}] {result['category']}：{result['summary']}")
 
     return new_count, skip_count
 
@@ -370,8 +454,9 @@ def main():
     new_count, skip_count = process_emails(emails, client)
     print(f"\n入库完成：新增 {new_count} 封，重复跳过 {skip_count} 封")
 
-    # 4. 从数据库读取今天的「紧急待办 / 重要阅读」，生成 Markdown 汇总
-    rows = db.list_emails(categories=KEY_CATEGORIES, today_only=True)
+    # 4. 从数据库读取「紧急待办 / 重要阅读」，生成 Markdown 汇总
+    #    不再限制「今天入库」，这样才能把历史遗留、已超时的邮件也列出来
+    rows = db.list_emails(categories=KEY_CATEGORIES)
     write_summary_md(rows)
 
     # 顺便在控制台打印分类统计
